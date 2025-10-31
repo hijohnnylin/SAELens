@@ -1,6 +1,7 @@
 import os
 from pathlib import Path
 
+import pytest
 import torch
 import torch.nn as nn
 
@@ -15,6 +16,7 @@ from tests.helpers import (
     assert_close,
     assert_not_close,
     build_batchtopk_sae_training_cfg,
+    random_params,
 )
 
 
@@ -119,6 +121,98 @@ def test_BatchTopK_output_must_be_positive():
     assert (output != 0).sum() == (x > 0).sum()
 
 
+def test_BatchTopK_with_3d_input():
+    """Test that BatchTopK correctly handles 3D inputs (batch, seq, features)."""
+    batch_topk = BatchTopK(k=2)
+    # Shape: (batch=2, seq=3, features=4)
+    x = torch.tensor(
+        [
+            [[1.0, -2.0, 3.0, -4.0], [5.0, 6.0, -7.0, 8.0], [9.0, -10.0, 11.0, -12.0]],
+            [
+                [-13.0, 14.0, -15.0, 16.0],
+                [17.0, -18.0, 19.0, -20.0],
+                [21.0, -22.0, 23.0, -24.0],
+            ],
+        ]
+    )
+
+    output = batch_topk(x)
+
+    # Should maintain the same shape
+    assert output.shape == x.shape
+
+    # Calculate expected number of active features
+    # num_samples = batch * seq = 2 * 3 = 6
+    # expected_active = k * num_samples = 2 * 6 = 12
+    num_samples = x.shape[0] * x.shape[1]  # batch * seq
+    expected_active = int(batch_topk.k * num_samples)
+
+    # Check that exactly k * num_samples values are non-zero
+    assert (output != 0).sum() == expected_active
+
+    # All outputs should be non-negative (ReLU applied)
+    assert (output >= 0).all()
+
+    # Average L0 per token should equal k
+    num_active_per_token = (output != 0).sum(dim=-1).float()
+    avg_l0 = num_active_per_token.mean().item()
+    assert avg_l0 == pytest.approx(batch_topk.k, abs=0.01)
+
+
+def test_BatchTopK_with_4d_input():
+    """Test that BatchTopK generalizes to 4D inputs."""
+    batch_topk = BatchTopK(k=3)
+    # Shape: (batch=2, dim1=2, seq=2, features=5)
+    # Use positive values to ensure we have enough features to select
+    x = torch.randn(2, 2, 2, 5) + 2.0
+
+    output = batch_topk(x)
+
+    # Should maintain the same shape
+    assert output.shape == x.shape
+
+    # Calculate expected number of active features
+    # num_samples = batch * dim1 * seq = 2 * 2 * 2 = 8
+    # expected_active = k * num_samples = 3 * 8 = 24
+    num_samples = x.shape[:-1].numel()
+    expected_active = int(batch_topk.k * num_samples)
+
+    # Check that exactly k * num_samples values are non-zero
+    actual_active = (output != 0).sum().item()
+    assert actual_active == expected_active
+
+    # All outputs should be non-negative (ReLU applied)
+    assert (output >= 0).all()
+
+
+def test_BatchTopK_l0_equals_k_for_various_shapes():
+    """Test that average L0 per sample equals k for various input shapes."""
+    k = 5
+    batch_topk = BatchTopK(k=k)
+
+    test_shapes = [
+        (20,),  # 1D: (features,)
+        (10, 20),  # 2D: (batch, features)
+        (4, 8, 20),  # 3D: (batch, seq, features)
+        (2, 3, 4, 20),  # 4D: (batch, dim1, seq, features)
+    ]
+
+    for shape in test_shapes:
+        x = torch.randn(*shape) + 2.0  # Shift to ensure enough positive values
+
+        output = batch_topk(x)
+
+        # Calculate average L0 per sample
+        num_samples = torch.Size(shape[:-1]).numel()
+        total_active = (output != 0).sum().item()
+        avg_l0 = total_active / num_samples
+
+        # Average L0 should equal k
+        assert avg_l0 == pytest.approx(
+            k, abs=0.01
+        ), f"Shape {shape}: expected L0={k}, got {avg_l0}"
+
+
 def test_BatchTopKTrainingSAEConfig_accepts_a_float_k():
     cfg = BatchTopKTrainingSAEConfig(k=1.5, d_in=10, d_sae=10)
     assert cfg.k == 1.5
@@ -148,22 +242,23 @@ def test_BatchTopKTrainingSAE_initialization():
     assert sae.topk_threshold.item() == 0.0
 
 
-def test_BatchTopKTrainingSAE_save_and_load_inference_sae(tmp_path: Path) -> None:
+@pytest.mark.parametrize("rescale_acts_by_decoder_norm", [True, False])
+def test_BatchTopKTrainingSAE_save_and_load_inference_sae(
+    tmp_path: Path, rescale_acts_by_decoder_norm: bool
+) -> None:
     # Create a training SAE with specific parameter values
-    cfg = build_batchtopk_sae_training_cfg(device="cpu")
+    cfg = build_batchtopk_sae_training_cfg(
+        device="cpu", rescale_acts_by_decoder_norm=rescale_acts_by_decoder_norm
+    )
     training_sae = BatchTopKTrainingSAE(cfg)
-
-    # Set some known values for testing
-    training_sae.W_enc.data = torch.randn_like(training_sae.W_enc.data)
-    training_sae.W_dec.data = torch.randn_like(training_sae.W_dec.data)
-    training_sae.b_enc.data = torch.randn_like(training_sae.b_enc.data)
-    training_sae.b_dec.data = torch.randn_like(training_sae.b_dec.data)
+    random_params(training_sae)
 
     sae_in = torch.randn(30, training_sae.cfg.d_in)
     train_step_input = TrainStepInput(
         sae_in=sae_in,
         coefficients={},
         dead_neuron_mask=None,
+        n_training_steps=0,
     )
 
     # run some test data through to learn the correct threshold
@@ -190,9 +285,18 @@ def test_BatchTopKTrainingSAE_save_and_load_inference_sae(tmp_path: Path) -> Non
     assert isinstance(inference_sae, JumpReLUSAE)
 
     # Check that all parameters match
-    assert_close(inference_sae.W_enc, original_W_enc)
-    assert_close(inference_sae.W_dec, original_W_dec)
-    assert_close(inference_sae.b_enc, original_b_enc)
+    if rescale_acts_by_decoder_norm:
+        assert_not_close(inference_sae.W_dec, original_W_dec)
+        assert_close(
+            inference_sae.W_dec.norm(dim=-1),
+            torch.ones_like(inference_sae.b_enc),
+        )
+        assert_not_close(inference_sae.W_enc, original_W_enc)
+        assert_not_close(inference_sae.b_enc, original_b_enc)
+    else:
+        assert_close(inference_sae.W_dec, original_W_dec)
+        assert_close(inference_sae.W_enc, original_W_enc)
+        assert_close(inference_sae.b_enc, original_b_enc)
     assert_close(inference_sae.b_dec, original_b_dec)
 
     # Check that topk_threshold was converted to threshold
@@ -235,6 +339,7 @@ def test_BatchTopKTrainingSAE_training_step_updates_threshold() -> None:
         sae_in=sae_in,
         coefficients={},
         dead_neuron_mask=None,
+        n_training_steps=0,
     )
 
     # Do training step
@@ -287,3 +392,125 @@ def test_BatchTopKTrainingSAE_process_state_dict_for_saving_inference() -> None:
     assert "threshold" in state_dict
     expected_threshold = torch.ones_like(sae.b_enc) * threshold_value
     assert_close(state_dict["threshold"], expected_threshold)
+
+
+def test_BatchTopKTrainingSAE_gives_same_results_after_folding_W_dec_norm_if_rescale_acts_by_decoder_norm():
+    cfg = build_batchtopk_sae_training_cfg(
+        k=2,
+        d_in=5,
+        d_sae=10,
+        rescale_acts_by_decoder_norm=True,
+    )
+    sae = BatchTopKTrainingSAE(cfg)
+    random_params(sae)
+
+    test_input = torch.randn(300, 5)
+
+    pre_fold_feats = sae.encode(test_input)
+    pre_fold_output = sae.decode(pre_fold_feats)
+
+    sae.fold_W_dec_norm()
+
+    post_fold_feats = sae.encode(test_input)
+    post_fold_output = sae.decode(post_fold_feats)
+
+    assert_close(pre_fold_feats, post_fold_feats, rtol=1e-2)
+    assert_close(pre_fold_output, post_fold_output, rtol=1e-2)
+
+
+def test_BatchTopKTrainingSAE_gives_same_results_as_if_decoder_is_already_normalized():
+    cfg = build_batchtopk_sae_training_cfg(
+        k=2,
+        d_in=5,
+        d_sae=10,
+        rescale_acts_by_decoder_norm=True,
+    )
+    cfg2 = build_batchtopk_sae_training_cfg(
+        k=2,
+        d_in=5,
+        d_sae=10,
+        rescale_acts_by_decoder_norm=False,
+    )
+    sae = BatchTopKTrainingSAE(cfg)
+    random_params(sae)
+
+    sae.fold_W_dec_norm()
+
+    sae2 = BatchTopKTrainingSAE(cfg2)
+    sae2.load_state_dict(sae.state_dict())
+
+    test_input = torch.randn(300, 5)
+
+    enhanced_acts = sae.encode(test_input)
+    enhanced_output = sae.decode(enhanced_acts)
+
+    topk_acts = sae2.encode(test_input)
+    topk_output = sae2.decode(topk_acts)
+
+    assert_close(enhanced_acts, topk_acts, rtol=1e-2)
+    assert_close(enhanced_output, topk_output, rtol=1e-2)
+
+
+def test_BatchTopKTrainingSAE_gives_same_output_despite_rescale_acts_by_decoder_norm_when_k_is_full():
+    cfg = build_batchtopk_sae_training_cfg(
+        k=10,
+        d_in=5,
+        d_sae=10,
+        rescale_acts_by_decoder_norm=True,
+    )
+    cfg2 = build_batchtopk_sae_training_cfg(
+        k=10,
+        d_in=5,
+        d_sae=10,
+        rescale_acts_by_decoder_norm=False,
+    )
+    sae = BatchTopKTrainingSAE(cfg)
+    random_params(sae)
+
+    sae2 = BatchTopKTrainingSAE(cfg2)
+    sae2.load_state_dict(sae.state_dict())
+
+    test_input = torch.randn(300, 5)
+
+    enhanced_acts = sae.encode(test_input)
+    enhanced_output = sae.decode(enhanced_acts)
+
+    topk_acts = sae2.encode(test_input)
+    topk_output = sae2.decode(topk_acts)
+
+    assert_not_close(enhanced_acts, topk_acts, rtol=1e-2)
+    assert_close(enhanced_output, topk_output, rtol=1e-2)
+
+
+def test_BatchTopKTrainingSAE_gives_same_output_despite_rescale_acts_by_decoder_norm_when_dec_is_scaled_uniformly():
+    cfg = build_batchtopk_sae_training_cfg(
+        k=2,
+        d_in=5,
+        d_sae=10,
+        rescale_acts_by_decoder_norm=True,
+    )
+    sae = BatchTopKTrainingSAE(cfg)
+    random_params(sae)
+
+    sae.fold_W_dec_norm()
+    sae.W_dec.data = sae.W_dec.data * 0.5
+
+    cfg2 = build_batchtopk_sae_training_cfg(
+        k=2,
+        d_in=5,
+        d_sae=10,
+        rescale_acts_by_decoder_norm=False,
+    )
+    sae2 = BatchTopKTrainingSAE(cfg2)
+    sae2.load_state_dict(sae.state_dict())
+
+    test_input = torch.randn(300, 5)
+
+    enhanced_acts = sae.encode(test_input)
+    enhanced_output = sae.decode(enhanced_acts)
+
+    topk_acts = sae2.encode(test_input)
+    topk_output = sae2.decode(topk_acts)
+
+    assert_not_close(enhanced_acts, topk_acts, rtol=1e-2)
+    assert_close(enhanced_output, topk_output, rtol=1e-2)

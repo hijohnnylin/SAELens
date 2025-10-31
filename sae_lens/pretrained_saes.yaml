@@ -1,3 +1,35 @@
+temporal-sae-gemma-2-2b:
+  conversion_func: temporal
+  model: gemma-2-2b
+  repo_id: canrager/temporalSAEs
+  config_overrides:
+    model_name: gemma-2-2b
+    hook_name: blocks.12.hook_resid_post
+    dataset_path: monology/pile-uncopyrighted
+  saes:
+  - id: blocks.12.hook_resid_post
+    l0: 192
+    norm_scaling_factor: 0.00666666667
+    path: gemma-2-2B/layer_12/temporal
+    neuronpedia: gemma-2-2b/12-temporal-res
+temporal-sae-llama-3.1-8b:
+  conversion_func: temporal
+  model: meta-llama/Llama-3.1-8B
+  repo_id: canrager/temporalSAEs
+  config_overrides:
+    model_name: meta-llama/Llama-3.1-8B
+    dataset_path: monology/pile-uncopyrighted
+  saes:
+  - id: blocks.15.hook_resid_post
+    l0: 256
+    norm_scaling_factor: 0.029
+    path: llama-3.1-8B/layer_15/temporal
+    neuronpedia: llama3.1-8b/15-temporal-res
+  - id: blocks.26.hook_resid_post
+    l0: 256
+    norm_scaling_factor: 0.029
+    path: llama-3.1-8B/layer_26/temporal
+    neuronpedia: llama3.1-8b/26-temporal-res
 deepseek-r1-distill-llama-8b-qresearch:
   conversion_func: deepseek_r1
   model: deepseek-ai/DeepSeek-R1-Distill-Llama-8B
@@ -14883,3 +14915,21 @@ qwen2.5-7b-instruct-andyrdt:
   - id: resid_post_layer_27_trainer_1
     path: resid_post_layer_27/trainer_1
     neuronpedia: qwen2.5-7b-it/27-resid-post-aa
+
+goodfire-llama-3.3-70b-instruct:
+  conversion_func: goodfire
+  model: meta-llama/Llama-3.3-70B-Instruct
+  repo_id: Goodfire/Llama-3.3-70B-Instruct-SAE-l50
+  saes:
+  - id: layer_50
+    path: Llama-3.3-70B-Instruct-SAE-l50.pt
+    l0: 121
+
+goodfire-llama-3.1-8b-instruct:
+  conversion_func: goodfire
+  model: meta-llama/Llama-3.1-8B-Instruct
+  repo_id: Goodfire/Llama-3.1-8B-Instruct-SAE-l19
+  saes:
+  - id: layer_19
+    path: Llama-3.1-8B-Instruct-SAE-l19.pth
+    l0: 91

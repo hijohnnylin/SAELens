@@ -233,6 +233,12 @@ def handle_pre_6_0_config(cfg_dict: dict[str, Any]) -> dict[str, Any]:
         "reshape_activations",
         "hook_z" if "hook_z" in new_cfg.get("hook_name", "") else "none",
     )
+    if (
+        new_cfg.get("activation_fn") == "topk"
+        and new_cfg.get("activation_fn_kwargs", {}).get("k") is not None
+    ):
+        new_cfg["architecture"] = "topk"
+        new_cfg["k"] = new_cfg["activation_fn_kwargs"]["k"]
 
     if "normalize_activations" in new_cfg and isinstance(
         new_cfg["normalize_activations"], bool
@@ -515,6 +521,82 @@ def gemma_2_sae_huggingface_loader(
         state_dict["W_dec"].data = state_dict["W_dec"].data * np.sqrt(cfg_dict["d_in"])
 
     return cfg_dict, state_dict, log_sparsity
+
+
+def get_goodfire_config_from_hf(
+    repo_id: str,
+    folder_name: str,  # noqa: ARG001
+    device: str,
+    force_download: bool = False,  # noqa: ARG001
+    cfg_overrides: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    cfg_dict = None
+    if repo_id == "Goodfire/Llama-3.3-70B-Instruct-SAE-l50":
+        if folder_name != "Llama-3.3-70B-Instruct-SAE-l50.pt":
+            raise ValueError(f"Unsupported Goodfire SAE: {repo_id}/{folder_name}")
+        cfg_dict = {
+            "architecture": "standard",
+            "d_in": 8192,
+            "d_sae": 65536,
+            "model_name": "meta-llama/Llama-3.3-70B-Instruct",
+            "hook_name": "blocks.50.hook_resid_post",
+            "hook_head_index": None,
+            "dataset_path": "lmsys/lmsys-chat-1m",
+            "apply_b_dec_to_input": False,
+        }
+    elif repo_id == "Goodfire/Llama-3.1-8B-Instruct-SAE-l19":
+        if folder_name != "Llama-3.1-8B-Instruct-SAE-l19.pth":
+            raise ValueError(f"Unsupported Goodfire SAE: {repo_id}/{folder_name}")
+        cfg_dict = {
+            "architecture": "standard",
+            "d_in": 4096,
+            "d_sae": 65536,
+            "model_name": "meta-llama/Llama-3.1-8B-Instruct",
+            "hook_name": "blocks.19.hook_resid_post",
+            "hook_head_index": None,
+            "dataset_path": "lmsys/lmsys-chat-1m",
+            "apply_b_dec_to_input": False,
+        }
+    if cfg_dict is None:
+        raise ValueError(f"Unsupported Goodfire SAE: {repo_id}/{folder_name}")
+    if device is not None:
+        cfg_dict["device"] = device
+    if cfg_overrides is not None:
+        cfg_dict.update(cfg_overrides)
+    return cfg_dict
+
+
+def get_goodfire_huggingface_loader(
+    repo_id: str,
+    folder_name: str,
+    device: str = "cpu",
+    force_download: bool = False,
+    cfg_overrides: dict[str, Any] | None = None,
+) -> tuple[dict[str, Any], dict[str, torch.Tensor], torch.Tensor | None]:
+    cfg_dict = get_goodfire_config_from_hf(
+        repo_id,
+        folder_name,
+        device,
+        force_download,
+        cfg_overrides,
+    )
+
+    # Download the SAE weights
+    sae_path = hf_hub_download(
+        repo_id=repo_id,
+        filename=folder_name,
+        force_download=force_download,
+    )
+    raw_state_dict = torch.load(sae_path, map_location=device)
+
+    state_dict = {
+        "W_enc": raw_state_dict["encoder_linear.weight"].T,
+        "W_dec": raw_state_dict["decoder_linear.weight"].T,
+        "b_enc": raw_state_dict["encoder_linear.bias"],
+        "b_dec": raw_state_dict["decoder_linear.bias"],
+    }
+
+    return cfg_dict, state_dict, None
 
 
 def get_llama_scope_config_from_hf(
@@ -1469,6 +1551,114 @@ def get_mntss_clt_layer_config_from_hf(
     }
 
 
+def get_temporal_sae_config_from_hf(
+    repo_id: str,
+    folder_name: str,
+    device: str,
+    force_download: bool = False,
+    cfg_overrides: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Get TemporalSAE config without loading weights."""
+    # Download config file
+    conf_path = hf_hub_download(
+        repo_id=repo_id,
+        filename=f"{folder_name}/conf.yaml",
+        force_download=force_download,
+    )
+
+    # Load and parse config
+    with open(conf_path) as f:
+        yaml_config = yaml.safe_load(f)
+
+    # Extract parameters
+    d_in = yaml_config["llm"]["dimin"]
+    exp_factor = yaml_config["sae"]["exp_factor"]
+    d_sae = int(d_in * exp_factor)
+
+    # extract layer from folder_name eg : "layer_12/temporal"
+    layer = re.search(r"layer_(\d+)", folder_name)
+    if layer is None:
+        raise ValueError(f"Could not find layer in folder_name: {folder_name}")
+    layer = int(layer.group(1))
+
+    # Build config dict
+    cfg_dict = {
+        "architecture": "temporal",
+        "hook_name": f"blocks.{layer}.hook_resid_post",
+        "d_in": d_in,
+        "d_sae": d_sae,
+        "n_heads": yaml_config["sae"]["n_heads"],
+        "n_attn_layers": yaml_config["sae"]["n_attn_layers"],
+        "bottleneck_factor": yaml_config["sae"]["bottleneck_factor"],
+        "sae_diff_type": yaml_config["sae"]["sae_diff_type"],
+        "kval_topk": yaml_config["sae"]["kval_topk"],
+        "tied_weights": yaml_config["sae"]["tied_weights"],
+        "dtype": yaml_config["data"]["dtype"],
+        "device": device,
+        "normalize_activations": "constant_scalar_rescale",
+        "activation_normalization_factor": yaml_config["sae"]["scaling_factor"],
+        "apply_b_dec_to_input": True,
+    }
+
+    if cfg_overrides:
+        cfg_dict.update(cfg_overrides)
+
+    return cfg_dict
+
+
+def temporal_sae_huggingface_loader(
+    repo_id: str,
+    folder_name: str,
+    device: str = "cpu",
+    force_download: bool = False,
+    cfg_overrides: dict[str, Any] | None = None,
+) -> tuple[dict[str, Any], dict[str, torch.Tensor], torch.Tensor | None]:
+    """
+    Load TemporalSAE from canrager/temporalSAEs format (safetensors version).
+
+    Expects folder_name to contain:
+    - conf.yaml (configuration)
+    - latest_ckpt.safetensors (model weights)
+    """
+
+    cfg_dict = get_temporal_sae_config_from_hf(
+        repo_id=repo_id,
+        folder_name=folder_name,
+        device=device,
+        force_download=force_download,
+        cfg_overrides=cfg_overrides,
+    )
+
+    # Download checkpoint (safetensors format)
+    ckpt_path = hf_hub_download(
+        repo_id=repo_id,
+        filename=f"{folder_name}/latest_ckpt.safetensors",
+        force_download=force_download,
+    )
+
+    # Load checkpoint from safetensors
+    state_dict_raw = load_file(ckpt_path, device=device)
+
+    # Convert to SAELens naming convention
+    # TemporalSAE uses: D (decoder), E (encoder), b (bias), attn_layers.*
+    state_dict = {}
+
+    # Copy attention layers as-is
+    for key, value in state_dict_raw.items():
+        if key.startswith("attn_layers."):
+            state_dict[key] = value.to(device)
+
+    # Main parameters
+    state_dict["W_dec"] = state_dict_raw["D"].to(device)
+    state_dict["b_dec"] = state_dict_raw["b"].to(device)
+
+    # Handle tied/untied weights
+    if "E" in state_dict_raw:
+        state_dict["W_enc"] = state_dict_raw["E"].to(device)
+
+    return cfg_dict, state_dict, None
+
+
 NAMED_PRETRAINED_SAE_LOADERS: dict[str, PretrainedSaeHuggingfaceLoader] = {
     "sae_lens": sae_lens_huggingface_loader,
     "connor_rob_hook_z": connor_rob_hook_z_huggingface_loader,
@@ -1481,6 +1671,8 @@ NAMED_PRETRAINED_SAE_LOADERS: dict[str, PretrainedSaeHuggingfaceLoader] = {
     "gemma_2_transcoder": gemma_2_transcoder_huggingface_loader,
     "mwhanna_transcoder": mwhanna_transcoder_huggingface_loader,
     "mntss_clt_layer_transcoder": mntss_clt_layer_huggingface_loader,
+    "temporal": temporal_sae_huggingface_loader,
+    "goodfire": get_goodfire_huggingface_loader,
 }
 
 
@@ -1496,4 +1688,6 @@ NAMED_PRETRAINED_SAE_CONFIG_GETTERS: dict[str, PretrainedSaeConfigHuggingfaceLoa
     "gemma_2_transcoder": get_gemma_2_transcoder_config_from_hf,
     "mwhanna_transcoder": get_mwhanna_transcoder_config_from_hf,
     "mntss_clt_layer_transcoder": get_mntss_clt_layer_config_from_hf,
+    "temporal": get_temporal_sae_config_from_hf,
+    "goodfire": get_goodfire_config_from_hf,
 }

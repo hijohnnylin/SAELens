@@ -14,6 +14,10 @@ from .jumprelu_sae import (
     JumpReLUTrainingSAE,
     JumpReLUTrainingSAEConfig,
 )
+from .matryoshka_batchtopk_sae import (
+    MatryoshkaBatchTopKTrainingSAE,
+    MatryoshkaBatchTopKTrainingSAEConfig,
+)
 from .sae import SAE, SAEConfig, TrainingSAE, TrainingSAEConfig
 from .standard_sae import (
     StandardSAE,
@@ -21,6 +25,7 @@ from .standard_sae import (
     StandardTrainingSAE,
     StandardTrainingSAEConfig,
 )
+from .temporal_sae import TemporalSAE, TemporalSAEConfig
 from .topk_sae import (
     TopKSAE,
     TopKSAEConfig,
@@ -65,4 +70,8 @@ __all__ = [
     "SkipTranscoderConfig",
     "JumpReLUTranscoder",
     "JumpReLUTranscoderConfig",
+    "MatryoshkaBatchTopKTrainingSAE",
+    "MatryoshkaBatchTopKTrainingSAEConfig",
+    "TemporalSAE",
+    "TemporalSAEConfig",
 ]

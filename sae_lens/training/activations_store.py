@@ -4,6 +4,7 @@ import json
 import os
 import warnings
 from collections.abc import Generator, Iterator, Sequence
+from pathlib import Path
 from typing import Any, Literal, cast
 
 import datasets
@@ -13,8 +14,8 @@ from huggingface_hub import hf_hub_download
 from huggingface_hub.utils import HfHubHTTPError
 from jaxtyping import Float, Int
 from requests import HTTPError
-from safetensors.torch import save_file
-from tqdm import tqdm
+from safetensors.torch import load_file, save_file
+from tqdm.auto import tqdm
 from transformer_lens.hook_points import HookedRootModule
 from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
@@ -24,12 +25,15 @@ from sae_lens.config import (
     HfDataset,
     LanguageModelSAERunnerConfig,
 )
-from sae_lens.constants import DTYPE_MAP
+from sae_lens.constants import ACTIVATIONS_STORE_STATE_FILENAME, DTYPE_MAP
 from sae_lens.pretokenize_runner import get_special_token_from_cfg
 from sae_lens.saes.sae import SAE, T_SAE_CONFIG, T_TRAINING_SAE_CONFIG
 from sae_lens.tokenization_and_batching import concat_and_batch_sequences
 from sae_lens.training.mixing_buffer import mixing_buffer
-from sae_lens.util import extract_stop_at_layer_from_tlens_hook_name
+from sae_lens.util import (
+    extract_stop_at_layer_from_tlens_hook_name,
+    get_special_token_ids,
+)
 
 
 # TODO: Make an activation store config class to be consistent with the rest of the code.
@@ -113,7 +117,7 @@ class ActivationsStore:
         if exclude_special_tokens is False:
             exclude_special_tokens = None
         if exclude_special_tokens is True:
-            exclude_special_tokens = _get_special_token_ids(model.tokenizer)  # type: ignore
+            exclude_special_tokens = get_special_token_ids(model.tokenizer)  # type: ignore
         if exclude_special_tokens is not None:
             exclude_special_tokens = torch.tensor(
                 exclude_special_tokens, dtype=torch.long, device=device
@@ -315,7 +319,7 @@ class ActivationsStore:
                 )
         else:
             warnings.warn(
-                "Dataset is not tokenized. Pre-tokenizing will improve performance and allows for more control over special tokens. See https://jbloomaus.github.io/SAELens/training_saes/#pretokenizing-datasets for more info."
+                "Dataset is not tokenized. Pre-tokenizing will improve performance and allows for more control over special tokens. See https://decoderesearch.github.io/SAELens/training_saes/#pretokenizing-datasets for more info."
             )
 
         self.iterable_sequences = self._iterate_tokenized_sequences()
@@ -726,6 +730,48 @@ class ActivationsStore:
         """save the state dict to a file in safetensors format"""
         save_file(self.state_dict(), file_path)
 
+    def save_to_checkpoint(self, checkpoint_path: str | Path):
+        """Save the state dict to a checkpoint path"""
+        self.save(str(Path(checkpoint_path) / ACTIVATIONS_STORE_STATE_FILENAME))
+
+    def load_from_checkpoint(self, checkpoint_path: str | Path):
+        """Load the state dict from a checkpoint path"""
+        self.load(str(Path(checkpoint_path) / ACTIVATIONS_STORE_STATE_FILENAME))
+
+    def load(self, file_path: str):
+        """Load the state dict from a file in safetensors format"""
+
+        state_dict = load_file(file_path)
+
+        if "n_dataset_processed" in state_dict:
+            target_n_dataset_processed = state_dict["n_dataset_processed"].item()
+
+            # Only fast-forward if needed
+
+            if target_n_dataset_processed > self.n_dataset_processed:
+                logger.info(
+                    "Fast-forwarding through dataset samples to match checkpoint position"
+                )
+                samples_to_skip = target_n_dataset_processed - self.n_dataset_processed
+
+                pbar = tqdm(
+                    total=samples_to_skip,
+                    desc="Fast-forwarding through dataset",
+                    leave=False,
+                )
+                while target_n_dataset_processed > self.n_dataset_processed:
+                    start = self.n_dataset_processed
+                    try:
+                        # Just consume and ignore the values to fast-forward
+                        next(self.iterable_sequences)
+                    except StopIteration:
+                        logger.warning(
+                            "Dataset exhausted during fast-forward. Resetting dataset."
+                        )
+                        self.iterable_sequences = self._iterate_tokenized_sequences()
+                    pbar.update(self.n_dataset_processed - start)
+                pbar.close()
+
 
 def validate_pretokenized_dataset_tokenizer(
     dataset_path: str, model_tokenizer: PreTrainedTokenizerBase
@@ -761,31 +807,6 @@ def _get_model_device(model: HookedRootModule) -> torch.device:
     if hasattr(model, "cfg") and hasattr(model.cfg, "device"):
         return model.cfg.device  # type: ignore
     return next(model.parameters()).device  # type: ignore
-
-
-def _get_special_token_ids(tokenizer: PreTrainedTokenizerBase) -> list[int]:
-    """Get all special token IDs from a tokenizer."""
-    special_tokens = set()
-
-    # Get special tokens from tokenizer attributes
-    for attr in dir(tokenizer):
-        if attr.endswith("_token_id"):
-            token_id = getattr(tokenizer, attr)
-            if token_id is not None:
-                special_tokens.add(token_id)
-
-    # Get any additional special tokens from the tokenizer's special tokens map
-    if hasattr(tokenizer, "special_tokens_map"):
-        for token in tokenizer.special_tokens_map.values():
-            if isinstance(token, str):
-                token_id = tokenizer.convert_tokens_to_ids(token)  # type: ignore
-                special_tokens.add(token_id)
-            elif isinstance(token, list):
-                for t in token:
-                    token_id = tokenizer.convert_tokens_to_ids(t)  # type: ignore
-                    special_tokens.add(token_id)
-
-    return list(special_tokens)
 
 
 def _filter_buffer_acts(

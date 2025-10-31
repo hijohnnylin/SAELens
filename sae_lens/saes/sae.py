@@ -14,7 +14,6 @@ from typing import (
     Generic,
     Literal,
     NamedTuple,
-    Type,
     TypeVar,
 )
 
@@ -22,7 +21,7 @@ import einops
 import torch
 from jaxtyping import Float
 from numpy.typing import NDArray
-from safetensors.torch import save_file
+from safetensors.torch import load_file, save_file
 from torch import nn
 from transformer_lens.hook_points import HookedRootModule, HookPoint
 from typing_extensions import deprecated, overload, override
@@ -156,9 +155,9 @@ class SAEConfig(ABC):
     dtype: str = "float32"
     device: str = "cpu"
     apply_b_dec_to_input: bool = True
-    normalize_activations: Literal[
-        "none", "expected_average_only_in", "constant_norm_rescale", "layer_norm"
-    ] = "none"  # none, expected_average_only_in (Anthropic April Update), constant_norm_rescale (Anthropic Feb Update)
+    normalize_activations: Literal["none", "expected_average_only_in", "layer_norm"] = (
+        "none"  # none, expected_average_only_in (Anthropic April Update)
+    )
     reshape_activations: Literal["none", "hook_z"] = "none"
     metadata: SAEMetadata = field(default_factory=SAEMetadata)
 
@@ -218,6 +217,7 @@ class TrainStepInput:
     sae_in: torch.Tensor
     coefficients: dict[str, float]
     dead_neuron_mask: torch.Tensor | None
+    n_training_steps: int
 
 
 class TrainCoefficientConfig(NamedTuple):
@@ -245,7 +245,7 @@ class SAE(HookedRootModule, Generic[T_SAE_CONFIG], ABC):
 
         self.cfg = cfg
 
-        if cfg.metadata and cfg.metadata:
+        if cfg.metadata and cfg.metadata.model_from_pretrained_kwargs:
             warnings.warn(
                 "\nThis SAE has non-empty model_from_pretrained_kwargs. "
                 "\nFor optimal performance, load the model like so:\n"
@@ -309,6 +309,7 @@ class SAE(HookedRootModule, Generic[T_SAE_CONFIG], ABC):
 
             self.run_time_activation_norm_fn_in = run_time_activation_norm_fn_in
             self.run_time_activation_norm_fn_out = run_time_activation_norm_fn_out
+
         elif self.cfg.normalize_activations == "layer_norm":
             #  we need to scale the norm of the input and store the scaling factor
             def run_time_activation_ln_in(
@@ -452,23 +453,14 @@ class SAE(HookedRootModule, Generic[T_SAE_CONFIG], ABC):
     def process_sae_in(
         self, sae_in: Float[torch.Tensor, "... d_in"]
     ) -> Float[torch.Tensor, "... d_in"]:
-        # print(f"Input shape to process_sae_in: {sae_in.shape}")
-        # print(f"self.cfg.hook_name: {self.cfg.hook_name}")
-        # print(f"self.b_dec shape: {self.b_dec.shape}")
-        # print(f"Hook z reshaping mode: {getattr(self, 'hook_z_reshaping_mode', False)}")
-
         sae_in = sae_in.to(self.dtype)
-
-        # print(f"Shape before reshape_fn_in: {sae_in.shape}")
         sae_in = self.reshape_fn_in(sae_in)
-        # print(f"Shape after reshape_fn_in: {sae_in.shape}")
 
         sae_in = self.hook_sae_input(sae_in)
         sae_in = self.run_time_activation_norm_fn_in(sae_in)
 
         # Here's where the error happens
         bias_term = self.b_dec * self.cfg.apply_b_dec_to_input
-        # print(f"Bias term shape: {bias_term.shape}")
 
         return sae_in - bias_term
 
@@ -534,7 +526,7 @@ class SAE(HookedRootModule, Generic[T_SAE_CONFIG], ABC):
     @classmethod
     @deprecated("Use load_from_disk instead")
     def load_from_pretrained(
-        cls: Type[T_SAE],
+        cls: type[T_SAE],
         path: str | Path,
         device: str = "cpu",
         dtype: str | None = None,
@@ -543,7 +535,7 @@ class SAE(HookedRootModule, Generic[T_SAE_CONFIG], ABC):
 
     @classmethod
     def load_from_disk(
-        cls: Type[T_SAE],
+        cls: type[T_SAE],
         path: str | Path,
         device: str = "cpu",
         dtype: str | None = None,
@@ -564,7 +556,7 @@ class SAE(HookedRootModule, Generic[T_SAE_CONFIG], ABC):
 
     @classmethod
     def from_pretrained(
-        cls: Type[T_SAE],
+        cls: type[T_SAE],
         release: str,
         sae_id: str,
         device: str = "cpu",
@@ -585,7 +577,7 @@ class SAE(HookedRootModule, Generic[T_SAE_CONFIG], ABC):
 
     @classmethod
     def from_pretrained_with_cfg_and_sparsity(
-        cls: Type[T_SAE],
+        cls: type[T_SAE],
         release: str,
         sae_id: str,
         device: str = "cpu",
@@ -684,7 +676,7 @@ class SAE(HookedRootModule, Generic[T_SAE_CONFIG], ABC):
         return sae, cfg_dict, log_sparsities
 
     @classmethod
-    def from_dict(cls: Type[T_SAE], config_dict: dict[str, Any]) -> T_SAE:
+    def from_dict(cls: type[T_SAE], config_dict: dict[str, Any]) -> T_SAE:
         """Create an SAE from a config dictionary."""
         sae_cls = cls.get_sae_class_for_architecture(config_dict["architecture"])
         sae_config_cls = cls.get_sae_config_class_for_architecture(
@@ -694,8 +686,8 @@ class SAE(HookedRootModule, Generic[T_SAE_CONFIG], ABC):
 
     @classmethod
     def get_sae_class_for_architecture(
-        cls: Type[T_SAE], architecture: str
-    ) -> Type[T_SAE]:
+        cls: type[T_SAE], architecture: str
+    ) -> type[T_SAE]:
         """Get the SAE class for a given architecture."""
         sae_cls, _ = get_sae_class(architecture)
         if not issubclass(sae_cls, cls):
@@ -1000,8 +992,8 @@ class TrainingSAE(SAE[T_TRAINING_SAE_CONFIG], ABC):
 
     @classmethod
     def get_sae_class_for_architecture(
-        cls: Type[T_TRAINING_SAE], architecture: str
-    ) -> Type[T_TRAINING_SAE]:
+        cls: type[T_TRAINING_SAE], architecture: str
+    ) -> type[T_TRAINING_SAE]:
         """Get the SAE class for a given architecture."""
         sae_cls, _ = get_sae_training_class(architecture)
         if not issubclass(sae_cls, cls):
@@ -1017,6 +1009,12 @@ class TrainingSAE(SAE[T_TRAINING_SAE_CONFIG], ABC):
         architecture: str,  # noqa: ARG003
     ) -> type[TrainingSAEConfig]:
         return get_sae_training_class(architecture)[1]
+
+    def load_weights_from_checkpoint(self, checkpoint_path: Path | str) -> None:
+        checkpoint_path = Path(checkpoint_path)
+        state_dict = load_file(checkpoint_path / SAE_WEIGHTS_FILENAME)
+        self.process_state_dict_for_loading(state_dict)
+        self.load_state_dict(state_dict)
 
 
 _blank_hook = nn.Identity()

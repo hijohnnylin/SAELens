@@ -1,5 +1,5 @@
 # ruff: noqa: E402
-__version__ = "6.12.1"
+__version__ = "6.20.1"
 
 import logging
 
@@ -19,6 +19,8 @@ from sae_lens.saes import (
     JumpReLUTrainingSAEConfig,
     JumpReLUTranscoder,
     JumpReLUTranscoderConfig,
+    MatryoshkaBatchTopKTrainingSAE,
+    MatryoshkaBatchTopKTrainingSAEConfig,
     SAEConfig,
     SkipTranscoder,
     SkipTranscoderConfig,
@@ -26,6 +28,8 @@ from sae_lens.saes import (
     StandardSAEConfig,
     StandardTrainingSAE,
     StandardTrainingSAEConfig,
+    TemporalSAE,
+    TemporalSAEConfig,
     TopKSAE,
     TopKSAEConfig,
     TopKTrainingSAE,
@@ -101,6 +105,10 @@ __all__ = [
     "SkipTranscoderConfig",
     "JumpReLUTranscoder",
     "JumpReLUTranscoderConfig",
+    "MatryoshkaBatchTopKTrainingSAE",
+    "MatryoshkaBatchTopKTrainingSAEConfig",
+    "TemporalSAE",
+    "TemporalSAEConfig",
 ]
 
 
@@ -115,6 +123,12 @@ register_sae_training_class("jumprelu", JumpReLUTrainingSAE, JumpReLUTrainingSAE
 register_sae_training_class(
     "batchtopk", BatchTopKTrainingSAE, BatchTopKTrainingSAEConfig
 )
+register_sae_training_class(
+    "matryoshka_batchtopk",
+    MatryoshkaBatchTopKTrainingSAE,
+    MatryoshkaBatchTopKTrainingSAEConfig,
+)
 register_sae_class("transcoder", Transcoder, TranscoderConfig)
 register_sae_class("skip_transcoder", SkipTranscoder, SkipTranscoderConfig)
 register_sae_class("jumprelu_transcoder", JumpReLUTranscoder, JumpReLUTranscoderConfig)
+register_sae_class("temporal", TemporalSAE, TemporalSAEConfig)

@@ -1,5 +1,6 @@
 import copy
-from typing import Any, Literal, Sequence, TypedDict, cast
+from collections.abc import Sequence
+from typing import Any, Literal, TypedDict, cast
 
 import pytest
 import torch
@@ -9,16 +10,30 @@ from sae_lens.config import LanguageModelSAERunnerConfig, LoggingConfig
 from sae_lens.saes.batchtopk_sae import BatchTopKTrainingSAEConfig
 from sae_lens.saes.gated_sae import GatedSAEConfig, GatedTrainingSAEConfig
 from sae_lens.saes.jumprelu_sae import JumpReLUSAEConfig, JumpReLUTrainingSAEConfig
+from sae_lens.saes.matryoshka_batchtopk_sae import MatryoshkaBatchTopKTrainingSAEConfig
 from sae_lens.saes.sae import T_TRAINING_SAE_CONFIG, SAEConfig, TrainingSAEConfig
 from sae_lens.saes.standard_sae import StandardSAEConfig, StandardTrainingSAEConfig
+from sae_lens.saes.temporal_sae import TemporalSAEConfig
 from sae_lens.saes.topk_sae import TopKSAEConfig, TopKTrainingSAEConfig
 
 TINYSTORIES_MODEL = "tiny-stories-1M"
-TINYSTORIES_DATASET = "roneneldan/TinyStories"
 NEEL_NANDA_C4_10K_DATASET = "NeelNanda/c4-10k"
 
-ALL_ARCHITECTURES = ["standard", "gated", "jumprelu", "topk"]
-ALL_TRAINING_ARCHITECTURES = ["standard", "gated", "jumprelu", "topk", "batchtopk"]
+ALL_ARCHITECTURES = ["standard", "gated", "jumprelu", "topk", "temporal"]
+ALL_FOLDABLE_ARCHITECTURES = [
+    "standard",
+    "gated",
+    "jumprelu",
+    "topk",
+]  # Architectures with fold W_dec to unit norm implementation
+ALL_TRAINING_ARCHITECTURES = [
+    "standard",
+    "gated",
+    "jumprelu",
+    "topk",
+    "batchtopk",
+    "matryoshka_batchtopk",
+]
 
 
 # This TypedDict should match the fields directly in LanguageModelSAERunnerConfig
@@ -97,12 +112,15 @@ class TrainingSAEConfigDict(TypedDict, total=False):
     jumprelu_init_threshold: float
     jumprelu_bandwidth: float
     k: int  # For TopK
+    use_sparse_activations: bool  # For TopK
     l0_coefficient: float  # For JumpReLU
     l0_warm_up_steps: int
     pre_act_loss_coefficient: float | None  # For JumpReLU
     topk_threshold_lr: float  # For BatchTopK
     jumprelu_sparsity_loss_mode: Literal["step", "tanh"]  # For JumpReLU
     jumprelu_tanh_scale: float  # For JumpReLU
+    rescale_acts_by_decoder_norm: bool  # For TopK
+    matryoshka_widths: list[int]  # For MatryoshkaBatchTopK
 
 
 class SAEConfigDict(TypedDict, total=False):
@@ -233,6 +251,15 @@ def _build_runner_config(
     return final_config
 
 
+def _update_sae_metadata(runner_cfg: LanguageModelSAERunnerConfig[Any]):
+    runner_cfg.sae.metadata.hook_name = runner_cfg.hook_name
+    runner_cfg.sae.metadata.hook_head_index = runner_cfg.hook_head_index
+    runner_cfg.sae.metadata.model_name = runner_cfg.model_name
+    runner_cfg.sae.metadata.model_class_name = runner_cfg.model_class_name
+    runner_cfg.sae.metadata.dataset_path = runner_cfg.dataset_path
+    runner_cfg.sae.metadata.prepend_bos = runner_cfg.prepend_bos
+
+
 # --- Standard SAE Builder ---
 def build_runner_cfg(
     **kwargs: Any,
@@ -255,12 +282,7 @@ def build_runner_cfg(
         cast(dict[str, Any], default_sae_config),
         **kwargs,
     )
-    runner_cfg.sae.metadata.hook_name = runner_cfg.hook_name
-    runner_cfg.sae.metadata.hook_head_index = runner_cfg.hook_head_index
-    runner_cfg.sae.metadata.model_name = runner_cfg.model_name
-    runner_cfg.sae.metadata.model_class_name = runner_cfg.model_class_name
-    runner_cfg.sae.metadata.dataset_path = runner_cfg.dataset_path
-    runner_cfg.sae.metadata.prepend_bos = runner_cfg.prepend_bos
+    _update_sae_metadata(runner_cfg)
     return runner_cfg
 
 
@@ -300,11 +322,13 @@ def build_jumprelu_runner_cfg(
         "l0_warm_up_steps": 0,
         "pre_act_loss_coefficient": None,
     }
-    return _build_runner_config(
+    runner_cfg = _build_runner_config(
         JumpReLUTrainingSAEConfig,
         cast(dict[str, Any], default_sae_config),
         **kwargs,
     )
+    _update_sae_metadata(runner_cfg)
+    return runner_cfg
 
 
 def build_jumprelu_sae_cfg(**kwargs: Any) -> JumpReLUSAEConfig:
@@ -338,11 +362,13 @@ def build_gated_runner_cfg(
         "apply_b_dec_to_input": False,
         "l1_warm_up_steps": 0,
     }
-    return _build_runner_config(
+    runner_cfg = _build_runner_config(
         GatedTrainingSAEConfig,
         cast(dict[str, Any], default_sae_config),
         **kwargs,
     )
+    _update_sae_metadata(runner_cfg)
+    return runner_cfg
 
 
 def build_gated_sae_cfg(**kwargs: Any) -> GatedSAEConfig:
@@ -374,6 +400,7 @@ def build_topk_runner_cfg(
         "decoder_init_norm": 0.1,
         "apply_b_dec_to_input": False,
         "k": 10,
+        "rescale_acts_by_decoder_norm": True,
     }
     # Ensure activation_fn_kwargs has k if k is overridden
     temp_sae_overrides = {
@@ -383,11 +410,13 @@ def build_topk_runner_cfg(
     # Update the default config *before* passing it to _build_runner_config
     final_default_sae_config = cast(dict[str, Any], temp_sae_config)
 
-    return _build_runner_config(
+    runner_cfg = _build_runner_config(
         TopKTrainingSAEConfig,
         final_default_sae_config,
         **kwargs,
     )
+    _update_sae_metadata(runner_cfg)
+    return runner_cfg
 
 
 def build_topk_sae_cfg(**kwargs: Any) -> TopKSAEConfig:
@@ -404,6 +433,25 @@ def build_topk_sae_cfg(**kwargs: Any) -> TopKSAEConfig:
 
 def build_topk_sae_training_cfg(**kwargs: Any) -> TopKTrainingSAEConfig:
     return build_topk_runner_cfg(**kwargs).sae  # type: ignore
+
+
+# --- Temporal SAE Builder ---
+def build_temporal_sae_cfg(**kwargs: Any) -> TemporalSAEConfig:
+    default_sae_config: dict[str, Any] = {
+        "d_in": 64,
+        "d_sae": 512,
+        "dtype": "bfloat16",
+        "device": "cpu",
+        "normalize_activations": "constant_scalar_rescale",
+        "activation_normalization_factor": 0.2,
+        "n_heads": 8,
+        "n_attn_layers": 1,
+        "bottleneck_factor": 2,
+        "sae_diff_type": "topk",
+        "kval_topk": 32,
+        "tied_weights": True,
+    }
+    return TemporalSAEConfig(**{**default_sae_config, **kwargs})  # type: ignore
 
 
 # --- BatchTopK SAE Builder ---
@@ -430,15 +478,57 @@ def build_batchtopk_runner_cfg(
     # Update the default config *before* passing it to _build_runner_config
     final_default_sae_config = cast(dict[str, Any], temp_sae_config)
 
-    return _build_runner_config(
+    runner_cfg = _build_runner_config(
         BatchTopKTrainingSAEConfig,
         final_default_sae_config,
         **kwargs,
     )
+    _update_sae_metadata(runner_cfg)
+    return runner_cfg
 
 
 def build_batchtopk_sae_training_cfg(**kwargs: Any) -> BatchTopKTrainingSAEConfig:
     return build_batchtopk_runner_cfg(**kwargs).sae  # type: ignore
+
+
+# --- Matryoshka BatchTopK SAE Builder ---
+def build_matryoshka_batchtopk_runner_cfg(
+    **kwargs: Any,
+) -> LanguageModelSAERunnerConfig[MatryoshkaBatchTopKTrainingSAEConfig]:
+    """Helper to create a mock instance for Matryoshka BatchTopK SAE."""
+    default_sae_config: TrainingSAEConfigDict = {
+        "matryoshka_widths": [10, kwargs.get("d_sae", 20)],
+        "d_in": 64,
+        "d_sae": 256,
+        "dtype": "float32",
+        "device": "cpu",
+        "normalize_activations": "none",
+        "decoder_init_norm": 0.1,
+        "apply_b_dec_to_input": False,
+        "k": 10,
+        "topk_threshold_lr": 0.02,
+    }
+    # Ensure activation_fn_kwargs has k if k is overridden
+    temp_sae_overrides = {
+        k: v for k, v in kwargs.items() if k in TrainingSAEConfigDict.__annotations__
+    }
+    temp_sae_config = {**default_sae_config, **temp_sae_overrides}
+    # Update the default config *before* passing it to _build_runner_config
+    final_default_sae_config = cast(dict[str, Any], temp_sae_config)
+
+    runner_cfg = _build_runner_config(
+        MatryoshkaBatchTopKTrainingSAEConfig,
+        final_default_sae_config,
+        **kwargs,
+    )
+    _update_sae_metadata(runner_cfg)
+    return runner_cfg
+
+
+def build_matryoshka_batchtopk_sae_training_cfg(
+    **kwargs: Any,
+) -> MatryoshkaBatchTopKTrainingSAEConfig:
+    return build_matryoshka_batchtopk_runner_cfg(**kwargs).sae  # type: ignore
 
 
 MODEL_CACHE: dict[str, HookedTransformer] = {}
@@ -458,47 +548,22 @@ def load_model_cached(model_name: str) -> HookedTransformer:
 
 
 def build_sae_cfg_for_arch(architecture: str, **kwargs: Any) -> SAEConfig:
-    if architecture == "standard":
-        return build_sae_cfg(**kwargs)
-    if architecture == "gated":
-        return build_gated_sae_cfg(**kwargs)
-    if architecture == "jumprelu":
-        return build_jumprelu_sae_cfg(**kwargs)
-    if architecture == "topk":
-        return build_topk_sae_cfg(**kwargs)
-    raise ValueError(f"Unknown architecture: {architecture}")
+    builder = SAE_CONFIG_BUILDERS[architecture]
+    return builder(**kwargs)
 
 
 def build_sae_training_cfg_for_arch(
     architecture: str, **kwargs: Any
 ) -> TrainingSAEConfig:
-    if architecture == "standard":
-        return build_sae_training_cfg(**kwargs)
-    if architecture == "gated":
-        return build_gated_sae_training_cfg(**kwargs)
-    if architecture == "jumprelu":
-        return build_jumprelu_sae_training_cfg(**kwargs)
-    if architecture == "topk":
-        return build_topk_sae_training_cfg(**kwargs)
-    if architecture == "batchtopk":
-        return build_batchtopk_sae_training_cfg(**kwargs)
-    raise ValueError(f"Unknown architecture: {architecture}")
+    builder = SAE_TRAINING_CONFIG_BUILDERS[architecture]
+    return builder(**kwargs)
 
 
 def build_runner_cfg_for_arch(
     architecture: str, **kwargs: Any
 ) -> LanguageModelSAERunnerConfig[Any]:
-    if architecture == "standard":
-        return build_runner_cfg(**kwargs)
-    if architecture == "gated":
-        return build_gated_runner_cfg(**kwargs)
-    if architecture == "jumprelu":
-        return build_jumprelu_runner_cfg(**kwargs)
-    if architecture == "topk":
-        return build_topk_runner_cfg(**kwargs)
-    if architecture == "batchtopk":
-        return build_batchtopk_runner_cfg(**kwargs)
-    raise ValueError(f"Unknown architecture: {architecture}")
+    builder = SAE_RUNNER_CONFIG_BUILDERS[architecture]
+    return builder(**kwargs)
 
 
 def assert_close(
@@ -568,3 +633,40 @@ def assert_not_close(
             check_stride=check_stride,
             msg=msg,
         )
+
+
+def random_params(model: torch.nn.Module) -> None:
+    """
+    Fill the parameters of a model with random values.
+    """
+    for param in model.parameters():
+        param.data = torch.rand_like(param)
+    for buffer in model.buffers():
+        buffer.data = torch.rand_like(buffer)
+
+
+SAE_TRAINING_CONFIG_BUILDERS = {
+    "standard": build_sae_training_cfg,
+    "gated": build_gated_sae_training_cfg,
+    "jumprelu": build_jumprelu_sae_training_cfg,
+    "topk": build_topk_sae_training_cfg,
+    "batchtopk": build_batchtopk_sae_training_cfg,
+    "matryoshka_batchtopk": build_matryoshka_batchtopk_sae_training_cfg,
+}
+
+SAE_CONFIG_BUILDERS = {
+    "standard": build_sae_cfg,
+    "gated": build_gated_sae_cfg,
+    "jumprelu": build_jumprelu_sae_cfg,
+    "topk": build_topk_sae_cfg,
+    "temporal": build_temporal_sae_cfg,
+}
+
+SAE_RUNNER_CONFIG_BUILDERS = {
+    "standard": build_runner_cfg,
+    "gated": build_gated_runner_cfg,
+    "jumprelu": build_jumprelu_runner_cfg,
+    "topk": build_topk_runner_cfg,
+    "batchtopk": build_batchtopk_runner_cfg,
+    "matryoshka_batchtopk": build_matryoshka_batchtopk_runner_cfg,
+}

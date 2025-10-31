@@ -1,13 +1,13 @@
 [tool.poetry]
 name = "sae-lens"
-version = "6.12.1"
+version = "6.20.1"
 description = "Training and Analyzing Sparse Autoencoders (SAEs)"
 authors = ["Joseph Bloom"]
 readme = "README.md"
 packages = [{ include = "sae_lens" }]
 include = ["pretrained_saes.yaml"]
-repository = "https://github.com/jbloomAus/SAELens"
-homepage = "https://jbloomaus.github.io/SAELens"
+repository = "https://github.com/decoderesearch/SAELens"
+homepage = "https://decoderesearch.github.io/SAELens"
 license = "MIT"
 keywords = [
     "deep-learning",
@@ -55,6 +55,7 @@ ruff = "^0.7.4"
 eai-sparsify = "^1.1.1"
 mike = "^2.0.0"
 trio = "^0.30.0"
+dictionary-learning = "^0.1.0"
 
 [tool.poetry.extras]
 mamba = ["mamba-lens"]

@@ -27,15 +27,22 @@ from sae_lens.evals import (
 )
 from sae_lens.load_model import load_model
 from sae_lens.loading.pretrained_saes_directory import PretrainedSAELookup
+from sae_lens.saes.batchtopk_sae import (
+    BatchTopKTrainingSAE,
+)
 from sae_lens.saes.sae import SAE, TrainingSAE
 from sae_lens.saes.standard_sae import StandardSAE, StandardTrainingSAE
+from sae_lens.saes.topk_sae import TopKTrainingSAE
 from sae_lens.training.activation_scaler import ActivationScaler
 from sae_lens.training.activations_store import ActivationsStore
 from tests.helpers import (
     NEEL_NANDA_C4_10K_DATASET,
     TINYSTORIES_MODEL,
+    build_batchtopk_runner_cfg,
     build_runner_cfg,
+    build_topk_runner_cfg,
     load_model_cached,
+    random_params,
 )
 
 TRAINER_EVAL_CONFIG = EvalConfig(
@@ -67,7 +74,7 @@ def _replace_nan(list: list[float]) -> list[float]:
     params=[
         {
             "model_name": "tiny-stories-1M",
-            "dataset_path": "roneneldan/TinyStories",
+            "dataset_path": "NeelNanda/c4-10k",
             "hook_name": "blocks.1.hook_resid_pre",
             "d_in": 64,
         },
@@ -79,19 +86,19 @@ def _replace_nan(list: list[float]) -> list[float]:
         },
         {
             "model_name": "tiny-stories-1M",
-            "dataset_path": "roneneldan/TinyStories",
+            "dataset_path": "NeelNanda/c4-10k",
             "hook_name": "blocks.1.attn.hook_z",
             "d_in": 16 * 4,
         },
         {
             "model_name": "tiny-stories-1M",
-            "dataset_path": "roneneldan/TinyStories",
+            "dataset_path": "NeelNanda/c4-10k",
             "hook_name": "blocks.1.attn.hook_q",
             "d_in": 16 * 4,
         },
         {
             "model_name": "tiny-stories-1M",
-            "dataset_path": "roneneldan/TinyStories",
+            "dataset_path": "NeelNanda/c4-10k",
             "hook_name": "blocks.1.attn.hook_q",
             "d_in": 4,
             "hook_head_index": 2,
@@ -170,6 +177,34 @@ def test_run_evals_base_sae(
     assert len(eval_metrics) > 0
 
 
+@pytest.mark.parametrize("use_sparse_activations", [True, False])
+def test_run_evals_sparse_topk_sae(
+    model: HookedTransformer,
+    use_sparse_activations: bool,
+):
+    cfg = build_topk_runner_cfg(
+        use_sparse_activations=use_sparse_activations,
+        model_name="tiny-stories-1M",
+        dataset_path="roneneldan/TinyStories",
+        hook_name="blocks.1.hook_resid_pre",
+        d_in=64,
+    )
+    sae = TopKTrainingSAE(cfg.sae)
+    activation_store = ActivationsStore.from_config(
+        model, cfg, override_dataset=Dataset.from_list([{"text": "hello world"}] * 2000)
+    )
+    eval_metrics, _ = run_evals(
+        sae=sae,
+        activation_store=activation_store,
+        activation_scaler=ActivationScaler(),
+        model=model,
+        eval_config=get_eval_everything_config(),
+    )
+
+    assert set(eval_metrics.keys()).issubset(set(all_possible_keys))
+    assert len(eval_metrics) > 0
+
+
 def test_run_evals_training_sae(
     training_sae: TrainingSAE[Any],
     activation_store: ActivationsStore,
@@ -199,7 +234,7 @@ def test_run_evals_training_sae_ignore_bos(
         activation_scaler=ActivationScaler(),
         model=model,
         eval_config=get_eval_everything_config(),
-        ignore_tokens={
+        exclude_special_tokens={
             model.tokenizer.bos_token_id,  # type: ignore
             model.tokenizer.eos_token_id,  # type: ignore
             model.tokenizer.pad_token_id,  # type: ignore
@@ -248,7 +283,7 @@ def test_training_eval_config_ignore_control_tokens(
         activation_scaler=ActivationScaler(),
         model=model,
         eval_config=eval_config,
-        ignore_tokens={
+        exclude_special_tokens={
             model.tokenizer.pad_token_id,  # type: ignore
             model.tokenizer.eos_token_id,  # type: ignore
             model.tokenizer.bos_token_id,  # type: ignore
@@ -685,3 +720,47 @@ def test_kl_matches_old_implementation():
     assert _original_kl(test_original_logits, test_new_logits) == pytest.approx(
         _kl(test_original_logits, test_new_logits)
     )
+
+
+def test_get_sparsity_and_variance_metrics_works_with_batchtopk_saes(
+    ts_model: HookedTransformer,
+):
+    example_dataset = Dataset.from_list(
+        [
+            {"text": "hello world1"},
+            {"text": "hello world2"},
+            {"text": "hello world3"},
+        ]
+        * 20
+    )
+    runner_cfg = build_batchtopk_runner_cfg(
+        k=2,
+        d_in=64,
+        d_sae=10,
+        rescale_acts_by_decoder_norm=True,
+    )
+    sae = BatchTopKTrainingSAE(runner_cfg.sae)
+    random_params(sae)
+    sae.b_enc.data = torch.randn(10) + 10.0
+
+    store = ActivationsStore.from_config(
+        ts_model, runner_cfg, override_dataset=example_dataset
+    )
+
+    # Get metrics
+    sparsity, _ = get_sparsity_and_variance_metrics(
+        sae=sae,
+        model=ts_model,
+        activation_store=store,
+        activation_scaler=ActivationScaler(),
+        n_batches=2,
+        compute_l2_norms=False,
+        compute_sparsity_metrics=True,
+        compute_variance_metrics=False,
+        compute_featurewise_density_statistics=False,
+        eval_batch_size_prompts=2,
+        model_kwargs={"device": "cpu"},
+    )
+
+    # Check that l0 is close to k
+    assert sparsity["l0"] == pytest.approx(2.0)

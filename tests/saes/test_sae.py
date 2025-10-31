@@ -1,14 +1,24 @@
 import copy
 import pickle
+from pathlib import Path
 
 import pytest
+import torch
 
 from sae_lens import __version__
 from sae_lens.registry import get_sae_class, get_sae_training_class
-from sae_lens.saes.sae import SAE, SAEConfig, SAEMetadata, TrainingSAEConfig
+from sae_lens.saes.sae import (
+    SAE,
+    SAEConfig,
+    SAEMetadata,
+    TrainingSAE,
+    TrainingSAEConfig,
+)
 from tests.helpers import (
     ALL_TRAINING_ARCHITECTURES,
+    assert_close,
     build_sae_training_cfg_for_arch,
+    random_params,
 )
 
 
@@ -27,7 +37,7 @@ def test_SAEConfig_to_and_from_dict_all_architectures(architecture: str):
         architecture
     ).get_inference_sae_cfg_dict()
     reloaded_cfg = SAEConfig.from_dict(cfg_dict)
-    if architecture == "batchtopk":
+    if architecture in {"batchtopk", "matryoshka_batchtopk"}:
         assert reloaded_cfg.architecture() == "jumprelu"
     else:
         assert reloaded_cfg.architecture() == architecture
@@ -211,3 +221,48 @@ def test_SAE_from_pretrained_deprecated_usage_as_tuple():
         DeprecationWarning, match="Getting length of SAE objects is deprecated"
     ):
         assert len(sae) == 3
+
+
+@pytest.mark.parametrize("architecture", ALL_TRAINING_ARCHITECTURES)
+def test_TrainingSAE_fold_activation_norm_scaling_factor_all_architectures(
+    architecture: str,
+):
+    cfg = build_sae_training_cfg_for_arch(architecture)
+    sae = TrainingSAE.from_dict(cfg.to_dict())
+    random_params(sae)
+
+    inputs = torch.randn(100, cfg.d_in)
+
+    original_outputs = sae(inputs)
+    original_features = sae.encode(inputs)
+
+    sae.fold_activation_norm_scaling_factor(2.0)
+
+    folded_outputs = 2.0 * sae(inputs / 2.0)
+    folded_features = sae.encode(inputs / 2.0)
+
+    assert_close(folded_outputs, original_outputs)
+    if architecture in {"topk", "batchtopk", "matryoshka_batchtopk"}:
+        # Due to how rescale_acts_by_decoder_norm works in TopKSAEs, it's equivalent to
+        # folding the W_dec norm after folding the activation norm scaling factor.
+        # this is fine, since we just care about the ouputs being the same.
+        assert_close(folded_features, original_features / 2.0)
+    else:
+        assert_close(folded_features, original_features)
+
+
+@pytest.mark.parametrize("architecture", ALL_TRAINING_ARCHITECTURES)
+def test_TrainingSAE_save_and_load_from_checkpoint_all_architectures(
+    architecture: str,
+    tmp_path: Path,
+):
+    cfg = build_sae_training_cfg_for_arch(architecture)
+    sae = TrainingSAE.from_dict(cfg.to_dict())
+    random_params(sae)
+
+    sae.save_model(tmp_path)
+    loaded_sae = TrainingSAE.from_dict(cfg.to_dict())
+    loaded_sae.load_weights_from_checkpoint(tmp_path)
+
+    for param1, param2 in zip(sae.parameters(), loaded_sae.parameters()):
+        assert_close(param1, param2, atol=1e-6, rtol=1e-4)

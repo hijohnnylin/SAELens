@@ -16,23 +16,18 @@ from typing_extensions import deprecated
 from sae_lens import logger
 from sae_lens.config import HfDataset, LanguageModelSAERunnerConfig
 from sae_lens.constants import (
-    ACTIVATIONS_STORE_STATE_FILENAME,
     RUNNER_CFG_FILENAME,
     SPARSITY_FILENAME,
 )
 from sae_lens.evals import EvalConfig, run_evals
 from sae_lens.load_model import load_model
-from sae_lens.saes.batchtopk_sae import BatchTopKTrainingSAEConfig
-from sae_lens.saes.gated_sae import GatedTrainingSAEConfig
-from sae_lens.saes.jumprelu_sae import JumpReLUTrainingSAEConfig
+from sae_lens.registry import SAE_TRAINING_CLASS_REGISTRY
 from sae_lens.saes.sae import (
     T_TRAINING_SAE,
     T_TRAINING_SAE_CONFIG,
     TrainingSAE,
     TrainingSAEConfig,
 )
-from sae_lens.saes.standard_sae import StandardTrainingSAEConfig
-from sae_lens.saes.topk_sae import TopKTrainingSAEConfig
 from sae_lens.training.activation_scaler import ActivationScaler
 from sae_lens.training.activations_store import ActivationsStore
 from sae_lens.training.sae_trainer import SAETrainer
@@ -61,9 +56,11 @@ class LLMSaeEvaluator(Generic[T_TRAINING_SAE]):
         data_provider: DataProvider,
         activation_scaler: ActivationScaler,
     ) -> dict[str, Any]:
-        ignore_tokens = set()
+        exclude_special_tokens = False
         if self.activations_store.exclude_special_tokens is not None:
-            ignore_tokens = set(self.activations_store.exclude_special_tokens.tolist())
+            exclude_special_tokens = (
+                self.activations_store.exclude_special_tokens.tolist()
+            )
 
         eval_config = EvalConfig(
             batch_size_prompts=self.eval_batch_size_prompts,
@@ -81,7 +78,7 @@ class LLMSaeEvaluator(Generic[T_TRAINING_SAE]):
             model=self.model,
             activation_scaler=activation_scaler,
             eval_config=eval_config,
-            ignore_tokens=ignore_tokens,
+            exclude_special_tokens=exclude_special_tokens,
             model_kwargs=self.model_kwargs,
         )  # not calculating featurwise metrics here.
 
@@ -114,6 +111,7 @@ class LanguageModelSAETrainingRunner:
         override_dataset: HfDataset | None = None,
         override_model: HookedRootModule | None = None,
         override_sae: TrainingSAE[Any] | None = None,
+        resume_from_checkpoint: Path | str | None = None,
     ):
         if override_dataset is not None:
             logger.warning(
@@ -155,6 +153,7 @@ class LanguageModelSAETrainingRunner:
                 )
         else:
             self.sae = override_sae
+
         self.sae.to(self.cfg.device)
 
     def run(self):
@@ -186,6 +185,12 @@ class LanguageModelSAETrainingRunner:
             save_checkpoint_fn=self.save_checkpoint,
             cfg=self.cfg.to_sae_trainer_config(),
         )
+
+        if self.cfg.resume_from_checkpoint is not None:
+            logger.info(f"Resuming from checkpoint: {self.cfg.resume_from_checkpoint}")
+            trainer.load_trainer_state(self.cfg.resume_from_checkpoint)
+            self.sae.load_weights_from_checkpoint(self.cfg.resume_from_checkpoint)
+            self.activations_store.load_from_checkpoint(self.cfg.resume_from_checkpoint)
 
         self._compile_if_needed()
         sae = self.run_trainer_with_interruption_handling(trainer)
@@ -306,9 +311,7 @@ class LanguageModelSAETrainingRunner:
         if checkpoint_path is None:
             return
 
-        self.activations_store.save(
-            str(checkpoint_path / ACTIVATIONS_STORE_STATE_FILENAME)
-        )
+        self.activations_store.save_to_checkpoint(checkpoint_path)
 
         runner_config = self.cfg.to_dict()
         with open(checkpoint_path / RUNNER_CFG_FILENAME, "w") as f:
@@ -393,12 +396,8 @@ def _parse_cfg_args(
         )
 
     # Map architecture to concrete config class
-    sae_config_map = {
-        "standard": StandardTrainingSAEConfig,
-        "gated": GatedTrainingSAEConfig,
-        "jumprelu": JumpReLUTrainingSAEConfig,
-        "topk": TopKTrainingSAEConfig,
-        "batchtopk": BatchTopKTrainingSAEConfig,
+    sae_config_map: dict[str, type[TrainingSAEConfig]] = {
+        name: cfg for name, (_, cfg) in SAE_TRAINING_CLASS_REGISTRY.items()
     }
 
     sae_config_type = sae_config_map[architecture]
